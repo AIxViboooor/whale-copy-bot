@@ -219,10 +219,10 @@ class WhaleTracker:
         """Fetch recent trades from the whale"""
         trades = []
         
+        # Try the profiles activity endpoint first
         try:
-            # Try the activity endpoint
             response = await self.http.get(
-                f"{POLYMARKET_DATA}/activity",
+                f"https://data-api.polymarket.com/activity",
                 params={
                     "address": self.whale_address,
                     "limit": 20
@@ -234,73 +234,159 @@ class WhaleTracker:
                 
                 for item in data:
                     try:
-                        trade_id = item.get("id") or f"{item.get('timestamp')}_{item.get('asset')}"
+                        trade_id = item.get("id") or item.get("transactionHash") or f"{item.get('timestamp')}_{item.get('asset')}"
                         
-                        # Skip if we've seen this trade
                         if trade_id in self.seen_trades:
                             continue
                         
-                        # Parse trade
                         side = item.get("side", "").upper()
                         if side not in ["BUY", "SELL"]:
-                            continue
+                            # Try to infer from type
+                            trade_type = item.get("type", "").upper()
+                            if "BUY" in trade_type:
+                                side = "BUY"
+                            elif "SELL" in trade_type:
+                                side = "SELL"
+                            else:
+                                continue
                         
-                        amount = float(item.get("usdcSize", 0) or item.get("size", 0) or 0)
+                        amount = float(item.get("usdcSize", 0) or item.get("value", 0) or item.get("size", 0) or 0)
                         if amount < MIN_WHALE_TRADE_SIZE:
                             continue
                         
+                        # Get token ID from various possible fields
+                        token_id = (
+                            item.get("asset") or 
+                            item.get("assetId") or 
+                            item.get("asset_id") or
+                            item.get("tokenId") or 
+                            item.get("token_id") or
+                            item.get("outcomeTokenId") or
+                            ""
+                        )
+                        
                         trades.append(WhaleTrade(
                             timestamp=item.get("timestamp", ""),
-                            market_id=item.get("conditionId", item.get("market", "")),
-                            market_title=item.get("title", item.get("question", "Unknown")),
+                            market_id=item.get("conditionId", item.get("condition_id", item.get("market", ""))),
+                            market_title=item.get("title", item.get("question", item.get("marketTitle", "Unknown"))),
                             side=side,
-                            outcome=item.get("outcome", "YES"),
+                            outcome=item.get("outcome", item.get("outcomeName", "YES")),
                             amount_usd=amount,
                             price=float(item.get("price", 0.5)),
-                            token_id=item.get("asset", item.get("tokenId", ""))
+                            token_id=token_id
                         ))
                         
                         self.seen_trades.add(trade_id)
                         
                     except Exception as e:
+                        print(f"⚠️  Error parsing trade: {e}")
                         continue
-            
+                        
         except Exception as e:
-            print(f"⚠️  Error fetching whale trades: {e}")
+            print(f"⚠️  Activity endpoint error: {e}")
         
-        # Also try trades endpoint
+        # Also try the trades endpoint
         try:
             response = await self.http.get(
-                f"{POLYMARKET_DATA}/trades",
+                f"https://clob.polymarket.com/trades",
                 params={
-                    "maker": self.whale_address,
+                    "maker_address": self.whale_address,
                     "limit": 20
                 }
             )
             
             if response.status_code == 200:
                 data = response.json()
-                for item in data:
+                items = data if isinstance(data, list) else data.get("trades", data.get("data", []))
+                
+                for item in items:
                     try:
-                        trade_id = item.get("id", f"{item.get('timestamp')}_{item.get('asset')}")
+                        trade_id = item.get("id") or item.get("trade_id") or f"{item.get('timestamp')}_{item.get('asset_id')}"
                         if trade_id in self.seen_trades:
                             continue
                         
-                        amount = float(item.get("size", 0) or 0) * float(item.get("price", 1))
+                        # Get side
+                        side = item.get("side", "").upper()
+                        if side not in ["BUY", "SELL"]:
+                            side = "BUY" if item.get("is_taker_buy", True) else "SELL"
+                        
+                        # Calculate amount
+                        size = float(item.get("size", 0) or item.get("amount", 0) or 0)
+                        price = float(item.get("price", 0.5))
+                        amount = size * price if size > 10 else size  # Handle different formats
+                        
                         if amount < MIN_WHALE_TRADE_SIZE:
+                            continue
+                        
+                        token_id = item.get("asset_id") or item.get("token_id") or item.get("market_id") or ""
+                        
+                        if not token_id:
                             continue
                         
                         outcome = "YES" if item.get("outcome_index", 0) == 0 else "NO"
                         
                         trades.append(WhaleTrade(
-                            timestamp=item.get("timestamp", ""),
-                            market_id=item.get("condition_id", ""),
-                            market_title=item.get("market", "Unknown"),
-                            side="BUY",
+                            timestamp=item.get("timestamp", item.get("created_at", "")),
+                            market_id=item.get("condition_id", item.get("market", "")),
+                            market_title=item.get("market_slug", item.get("title", "Unknown")),
+                            side=side,
                             outcome=outcome,
                             amount_usd=amount,
-                            price=float(item.get("price", 0.5)),
-                            token_id=item.get("asset_id", item.get("token_id", ""))
+                            price=price,
+                            token_id=token_id
+                        ))
+                        
+                        self.seen_trades.add(trade_id)
+                        
+                    except Exception as e:
+                        continue
+                        
+        except Exception as e:
+            print(f"⚠️  Trades endpoint error: {e}")
+        
+        # Try taker trades endpoint
+        try:
+            response = await self.http.get(
+                f"https://clob.polymarket.com/trades",
+                params={
+                    "taker_address": self.whale_address,
+                    "limit": 20
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                items = data if isinstance(data, list) else data.get("trades", data.get("data", []))
+                
+                for item in items:
+                    try:
+                        trade_id = item.get("id") or f"taker_{item.get('timestamp')}_{item.get('asset_id')}"
+                        if trade_id in self.seen_trades:
+                            continue
+                        
+                        side = "BUY" if item.get("side", "").upper() == "BUY" else "SELL"
+                        
+                        size = float(item.get("size", 0) or 0)
+                        price = float(item.get("price", 0.5))
+                        amount = size * price if size > 10 else size
+                        
+                        if amount < MIN_WHALE_TRADE_SIZE:
+                            continue
+                        
+                        token_id = item.get("asset_id") or item.get("token_id") or ""
+                        
+                        if not token_id:
+                            continue
+                        
+                        trades.append(WhaleTrade(
+                            timestamp=item.get("timestamp", ""),
+                            market_id=item.get("condition_id", ""),
+                            market_title=item.get("market_slug", "Unknown"),
+                            side=side,
+                            outcome="YES" if item.get("outcome_index", 0) == 0 else "NO",
+                            amount_usd=amount,
+                            price=price,
+                            token_id=token_id
                         ))
                         
                         self.seen_trades.add(trade_id)
