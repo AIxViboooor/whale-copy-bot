@@ -164,11 +164,38 @@ class PolymarketTrader:
             signed_order = self.clob_client.create_market_order(order_args)
             result = self.clob_client.post_order(signed_order, OrderType.FOK)
             
-            print(f"✅ Order executed: {result}")
+            print(f"✅ BUY order executed: {result}")
             return True
             
         except Exception as e:
-            print(f"❌ Order failed: {e}")
+            print(f"❌ BUY order failed: {e}")
+            return False
+    
+    async def sell(self, token_id: str, amount_usd: float) -> bool:
+        """Execute a market sell order"""
+        if not self.initialized:
+            print("❌ Client not initialized")
+            return False
+        
+        try:
+            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            from py_clob_client.order_builder.constants import SELL
+            
+            # Create market order
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount_usd,
+                side=SELL,
+            )
+            
+            signed_order = self.clob_client.create_market_order(order_args)
+            result = self.clob_client.post_order(signed_order, OrderType.FOK)
+            
+            print(f"✅ SELL order executed: {result}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ SELL order failed: {e}")
             return False
     
     async def close(self):
@@ -338,22 +365,23 @@ class WhaleCopyBot:
             print("⚠️  Daily trade limit reached, skipping")
             return False
         
-        # Only copy BUY trades
-        if whale_trade.side != "BUY":
-            print("⚠️  Skipping SELL trade (we only copy BUY)")
-            return False
-        
         if not whale_trade.token_id:
             print("⚠️  No token ID available, skipping")
             return False
         
-        # Execute our copy trade
-        success = await self.trader.buy(whale_trade.token_id, COPY_AMOUNT_USD)
+        # Execute our copy trade - BUY or SELL
+        if whale_trade.side == "BUY":
+            success = await self.trader.buy(whale_trade.token_id, COPY_AMOUNT_USD)
+        elif whale_trade.side == "SELL":
+            success = await self.trader.sell(whale_trade.token_id, COPY_AMOUNT_USD)
+        else:
+            print(f"⚠️  Unknown trade side: {whale_trade.side}, skipping")
+            return False
         
         if success:
             self.trades_today += 1
             self.total_copied += 1
-            print(f"✅ Successfully copied trade!")
+            print(f"✅ Successfully copied {whale_trade.side} trade!")
         else:
             print(f"❌ Failed to copy trade")
         
